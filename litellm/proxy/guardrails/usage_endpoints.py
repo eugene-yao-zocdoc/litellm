@@ -5,6 +5,7 @@ GET /guardrails/usage/overview, /guardrails/usage/detail/:id, /guardrails/usage/
 
 import json
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, Query
@@ -144,6 +145,105 @@ def _get_guardrail_attrs(g: Any) -> tuple[Any, str]:
     return gid, (name or gid or "")
 
 
+def _normalize_in_memory_guardrail(guardrail: Any) -> SimpleNamespace:
+    """Adapt an in-memory Guardrail into the attribute-access shape the row
+    builders expect.
+
+    In-memory (config-sourced) guardrails store ``litellm_params`` as a
+    ``LitellmParams`` pydantic model and carry no ``guardrail_info`` key, whereas
+    ``_guardrail_overview_rows`` / ``guardrails_usage_detail`` read
+    ``g.litellm_params`` / ``g.guardrail_info`` as dict-valued attributes. Dump
+    the params to a dict and default missing info to ``{}`` — mirrors the
+    ``.model_dump()`` conversion ``guardrail_endpoints.py`` already does.
+    """
+    raw_params = guardrail.get("litellm_params")
+    if hasattr(raw_params, "model_dump"):
+        litellm_params = raw_params.model_dump(exclude_none=True)
+    elif isinstance(raw_params, dict):
+        litellm_params = raw_params
+    else:
+        litellm_params = {}
+    guardrail_info = guardrail.get("guardrail_info")
+    return SimpleNamespace(
+        guardrail_id=guardrail.get("guardrail_id"),
+        guardrail_name=guardrail.get("guardrail_name"),
+        litellm_params=litellm_params,
+        guardrail_info=guardrail_info if isinstance(guardrail_info, dict) else {},
+    )
+
+
+def _config_guardrail_entries(db_guardrails: Any) -> List[Any]:
+    """Config-defined guardrails (from config.yaml) live only in the in-memory
+    registry, never in the guardrails DB table. Return normalized entries for the
+    config-sourced ones not already represented by a DB row, so the dashboard can
+    surface them.
+
+    Mirrors the merge ``guardrail_endpoints.py::list_guardrails`` performs:
+    dedupe against DB rows (by id and by name), and skip stale ``source=="db"``
+    entries whose DB row was deleted (e.g. on another pod) but not yet reconciled.
+    """
+    from litellm.proxy.guardrails.guardrail_registry import IN_MEMORY_GUARDRAIL_HANDLER
+
+    seen_ids: set = set()
+    seen_names: set = set()
+    for g in db_guardrails:
+        gid, name = _get_guardrail_attrs(g)
+        if gid:
+            seen_ids.add(gid)
+        if name:
+            seen_names.add(name)
+
+    entries: List[Any] = []
+    for guardrail in IN_MEMORY_GUARDRAIL_HANDLER.list_in_memory_guardrails():
+        gid = guardrail.get("guardrail_id")
+        # Only surface config-sourced entries; a "db"-sourced in-memory entry
+        # missing from the DB is stale and must not appear.
+        if gid is None or IN_MEMORY_GUARDRAIL_HANDLER.get_source(gid) != "config":
+            continue
+        name = guardrail.get("guardrail_name")
+        if gid in seen_ids or (name and name in seen_names):
+            continue
+        entries.append(_normalize_in_memory_guardrail(guardrail))
+    return entries
+
+
+def _overview_guardrails(db_guardrails: Any) -> List[Any]:
+    """Merge the DB guardrail rows with the config-sourced in-memory entries for
+    the overview. Extracted from the endpoint so the merge is unit-testable
+    without booting the proxy. Order is irrelevant to the row builder.
+    """
+    return list(db_guardrails) + _config_guardrail_entries(db_guardrails)
+
+
+def _config_guardrail_detail(guardrail_id: str) -> Optional[SimpleNamespace]:
+    """Resolve a config-defined guardrail for the detail endpoint from the
+    in-memory registry. Returns the normalized entry when guardrail_id maps to a
+    config-sourced guardrail, else None (the endpoint 404s on None). A db/None
+    source or no in-memory match yields None. Extracted from the endpoint so the
+    fallback is unit-testable without fastapi. Mirrors the get_guardrail fallback
+    in guardrail_endpoints.py.
+    """
+    from litellm.proxy.guardrails.guardrail_registry import IN_MEMORY_GUARDRAIL_HANDLER
+
+    in_memory = IN_MEMORY_GUARDRAIL_HANDLER.get_guardrail_by_id(guardrail_id=guardrail_id)
+    if in_memory is not None and IN_MEMORY_GUARDRAIL_HANDLER.get_source(guardrail_id) == "config":
+        return _normalize_in_memory_guardrail(in_memory)
+    return None
+
+
+def _usage_log_guardrail_ids(guardrail_id: str, db_guardrail: Any) -> List[str]:
+    """Return index identifiers for a DB- or config-defined guardrail."""
+    identifiers = [guardrail_id]
+    guardrail = db_guardrail or _config_guardrail_detail(guardrail_id)
+    if guardrail is None:
+        return identifiers
+
+    _, logical_name = _get_guardrail_attrs(guardrail)
+    if logical_name and logical_name not in identifiers:
+        identifiers.append(logical_name)
+    return identifiers
+
+
 def _guardrail_overview_rows(
     guardrails: Any,
     agg: Dict[str, Dict[str, Any]],
@@ -266,6 +366,13 @@ async def guardrails_usage_overview(
         # Guardrails from DB
         guardrails = await GuardrailsRepository(prisma_client).table.find_many()
 
+        # Config-defined guardrails aren't persisted to the DB table; merge the
+        # in-memory (config-sourced) entries so they appear in the overview
+        # immediately (req=0 until metrics accrue) with their real guardrail_id.
+        # Being included here also lists their id/name in `covered_keys`, so the
+        # orphan-metric fallback in _guardrail_overview_rows won't double-add them.
+        guardrails = _overview_guardrails(guardrails)
+
         # Daily metrics in range
         metrics = await DailyGuardrailMetricsRepository(prisma_client).table.find_many(
             where={"date": {"gte": start, "lte": end}}
@@ -322,6 +429,11 @@ async def guardrails_usage_detail(
     start = start_date or (now - timedelta(days=7)).strftime("%Y-%m-%d")
 
     guardrail = await GuardrailsRepository(prisma_client).table.find_unique(where={"guardrail_id": guardrail_id})
+    if not guardrail:
+        # Config-defined guardrails aren't in the DB table; resolve them from the
+        # in-memory registry (config source only) instead of 404ing. A "db"-sourced
+        # or unknown id yields None, which still 404s below.
+        guardrail = _config_guardrail_detail(guardrail_id)
     if not guardrail:
         from fastapi import HTTPException
 
@@ -544,17 +656,18 @@ async def guardrails_usage_logs(
         return UsageLogsResponse(logs=[], total=0, page=page, page_size=page_size)
 
     try:
-        # Index rows may store either guardrail_id (UUID) or guardrail_name from metadata.
-        # Query by both so we match regardless of which was written.
-        effective_guardrail_ids: List[str] = [guardrail_id] if guardrail_id else []
+        # Index rows store the logical name emitted by standard guardrail logging.
+        # The UI sends the configured guardrail UUID, so resolve both DB-backed and
+        # config-backed guardrails and query by UUID plus logical name.
+        effective_guardrail_ids: List[str] = []
         if guardrail_id:
             guardrail = await GuardrailsRepository(prisma_client).table.find_unique(
                 where={"guardrail_id": guardrail_id}
             )
-            if guardrail:
-                logical_name = getattr(guardrail, "guardrail_name", None)
-                if logical_name and logical_name not in effective_guardrail_ids:
-                    effective_guardrail_ids.append(logical_name)
+            effective_guardrail_ids = _usage_log_guardrail_ids(
+                guardrail_id,
+                guardrail,
+            )
 
         where = _build_usage_logs_where(effective_guardrail_ids or None, policy_id, start_date, end_date)
         index_rows = await SpendLogGuardrailIndexRepository(prisma_client).table.find_many(
