@@ -1,31 +1,152 @@
-# Anthropic Responses Adapter Strictness Bug - Design Doc
+# Anthropic Responses API Strictness Default Design Spec
+
+**Date**: 2026-08-24
+**Component**: `litellm/llms/anthropic/experimental_pass_through/responses_adapters/transformation.py`
+**Mapped Test**: `tests/test_litellm/llms/anthropic/experimental_pass_through/responses_adapters/test_responses_adapters_transformation.py`
 
 ## Problem Statement
 
-The Responses adapter's `translate_request` function hardcodes `strict=True` when setting `output_format` or nested `output_config.format`, regardless of whether the caller provided an explicit strictness value.
+The Anthropic experimental pass-through for Responses API currently hardcodes `strict: true` when translating structured output (JSON schema) requests. This prevents users from explicitly setting `strict: false` or omitting the field to use the OpenAI API default. The implementation should allow:
 
-## Root Cause
+1. Explicit control over the strictness setting
+2. Output format precedence over nested config
+3. Preservation of schema and required fields
+4. No mutation of input request data
 
-In `litellm/llms/anthropic/experimental_pass_through/responses_adapters/transformation.py`, the logic that builds output configuration unconditionally sets `strict=True` for any output format translation, overwriting caller-supplied values.
+## Design
 
-## Desired Behavior
+### Strictness Default Behavior
 
-- When `strict` is omitted, default to `False`
-- When `strict` is explicitly set (to `True` or `False`), preserve that value
-- Schema reference and required fields remain unchanged
-- Chat Completions and tool strictness handling out of scope
+- **Default (omitted `strict`)**: `false` — align with OpenAI's API default behavior
+- **Explicit `true`**: Preserved as specified by user
+- **Explicit `false`**: Preserved as specified by user
 
-## Solution Scope
+### Field Precedence
 
-Fix the translate_request function to:
-1. Check if strict was explicitly provided by the caller
-2. If omitted, use `False` as default
-3. If provided, preserve the caller's value in output configuration
+```
+output_format.strict (if present)
+  ↓ (precedence)
+output_config.format.strict (if output_format absent)
+  ↓ (fallback)
+false (API default)
+```
 
-This applies to both `output_format` and nested `output_config.format` cases.
+### Schema and Required List Preservation
 
-## Non-Goals
+All schema properties must be passed through unchanged:
+- `schema.properties` — preserved exactly
+- `schema.required` — preserved exactly
+- `schema.additionalProperties` — preserved exactly
+- All other schema fields — preserved unchanged
 
-- Chat Completions API strictness behavior
-- Tool strictness handling
-- Changes to schema validation or required field handling
+### Request Mutation
+
+Input request objects must not be mutated. All reads are non-destructive.
+
+## Implementation Location
+
+**File**: `litellm/llms/anthropic/experimental_pass_through/responses_adapters/transformation.py`
+
+**Method**: `LiteLLMAnthropicToResponsesAPIAdapter.translate_request()`
+
+**Lines**: 357–374 (current; may shift after edit)
+
+Current behavior (lines 364–374):
+```python
+if isinstance(output_format, dict) and output_format.get("type") == "json_schema":
+    schema: Final = output_format.get("schema")
+    if schema:
+        responses_kwargs["text"] = {
+            "format": {
+                "type": "json_schema",
+                "name": "structured_output",
+                "schema": schema,
+                "strict": True,  # HARDCODED
+            }
+        }
+```
+
+Expected behavior after fix:
+- Read `output_format.strict` (if exists)
+- Fall back to `output_config.format.strict` (if output_format absent and format exists)
+- Default to `false` if neither is specified
+- Preserve schema, required list, and all other fields unchanged
+
+## Test Cases
+
+### TC1: Omitted Strict (Default)
+**Input**: `output_config={"format": {"type": "json_schema", "schema": {...}}}`
+
+**Expected**: `text.format.strict = false`
+
+**Verification**: Schema present, strict field absent from input, output has `strict: false`
+
+### TC2: Explicit False
+**Input**: `output_format={"type": "json_schema", "schema": {...}, "strict": false}`
+
+**Expected**: `text.format.strict = false`
+
+**Verification**: Strict explicitly false in input, output has `strict: false`
+
+### TC3: Explicit True
+**Input**: `output_format={"type": "json_schema", "schema": {...}, "strict": true}`
+
+**Expected**: `text.format.strict = true`
+
+**Verification**: Strict explicitly true in input, output has `strict: true`
+
+### TC4: Nested Format with Strict
+**Input**: `output_config={"format": {"type": "json_schema", "schema": {...}, "strict": false}}`
+
+**Expected**: `text.format.strict = false`
+
+**Verification**: Uses output_config when output_format absent, respects nested strict value
+
+### TC5: Output Format Precedence
+**Input**: 
+```python
+output_format={"type": "json_schema", "schema": schema_a, "strict": false}
+output_config={"format": {"type": "json_schema", "schema": schema_b, "strict": true}}
+```
+
+**Expected**: 
+- Uses `schema_a` (output_format schema)
+- Uses `strict: false` (output_format strict)
+
+**Verification**: output_format takes complete precedence; neither output_config.format nor its strict value are used
+
+### TC6: Optional Properties Unchanged
+**Input**: 
+```python
+output_format={
+  "type": "json_schema",
+  "schema": {
+    "type": "object",
+    "properties": {"name": {"type": "string"}},
+    "required": ["name"],
+    "additionalProperties": False,
+    "description": "Custom schema"
+  }
+}
+```
+
+**Expected**: All schema properties (including `description`, `additionalProperties`) preserved in output
+
+**Verification**: `text.format.schema` matches input schema exactly
+
+### TC7: No Input Mutation
+**Input**: Request object with output_format and output_config
+
+**Expected**: Input request object unchanged after translation
+
+**Verification**: Original request dict unchanged; all operations are read-only
+
+## Backward Compatibility
+
+Current behavior hardcodes `strict: true`, so any code relying on that must be updated:
+
+- **Existing tests** in `test_responses_adapters_transformation.py`:
+  - Line 138: `assert fmt["strict"] is True` must change to allow both true and false
+  - All other tests remain valid
+
+- **External users**: Users who relied on hardcoded strict=true should explicitly set it in output_format if needed
