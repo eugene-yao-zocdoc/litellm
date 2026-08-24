@@ -143,10 +143,12 @@ output_format={
 
 ## Backward Compatibility
 
-Current behavior hardcodes `strict: true`, so any code relying on that must be updated:
+**Explicit `strict` values remain compatible**: Callers that explicitly set `strict: true` or `strict: false` are unaffected by this change.
+
+**Implicit behavior changes**: The default when `strict` is omitted changes from the historical hardcoded `true` to `false` (aligning with OpenAI's API default). Callers relying on the implicit `strict: true` behavior must explicitly set it to maintain that behavior.
 
 - **Existing tests** in `test_responses_adapters_transformation.py`:
-  - Line 138: `assert fmt["strict"] is True` must change to allow both true and false
+  - Line 138: `assert fmt["strict"] is True` must be updated to reflect the new default
   - All other tests remain valid
 
-- **External users**: Users who relied on hardcoded strict=true should explicitly set it in output_format if needed
+- **External users**: Users who relied on implicit `strict: true` should explicitly set `strict: true` in their output_format to preserve that behavior

@@ -200,7 +200,7 @@ def test_translate_request_does_not_mutate_input():
 
 ## Risk Assessment
 
-**Low**: This change only affects structured output translation logic; no network calls or external API changes. Hardcoded default was a bug; fixing it improves usability. Users who need strict=true can now specify it explicitly (backward compatible way).
+**Low**: This change only affects structured output translation logic; no network calls or external API changes. The default behavior shifts from implicit `strict: true` to `strict: false` (aligning with OpenAI's API default). Explicit `strict` values remain compatible, but callers relying on the implicit `strict: true` behavior must explicitly set it to maintain that behavior.
 
 ## Rollback Plan
 
